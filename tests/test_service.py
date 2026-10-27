@@ -107,3 +107,25 @@ def test_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     s = Settings.from_env()
     assert (s.dim, s.batch_size) == (512, 4)
     assert Settings.from_env(dim=128).dim == 128
+
+
+def test_concurrent_searches_share_store_safely(cs: CodeSeek) -> None:
+    import threading
+
+    cs.index()
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            for _ in range(30):
+                assert cs.search("token", k=2)
+                assert cs.status().indexed
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,12 +46,15 @@ class CodeSeek:
         self.root = find_repo_root(root)
         self.store = IndexStore.for_repo(self.root, self.settings.index_root)
         self._embedder = embedder
+        self._embedder_lock = threading.Lock()
 
     @property
     def embedder(self) -> Embedder:
         """Created on first use, so status/clear work without any backend installed."""
         if self._embedder is None:
-            self._embedder = make_embedder(self.settings, self.store.get_meta("model_id"))
+            with self._embedder_lock:
+                if self._embedder is None:
+                    self._embedder = make_embedder(self.settings, self.store.get_meta("model_id"))
         return self._embedder
 
     def close(self) -> None:

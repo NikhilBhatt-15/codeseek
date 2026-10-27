@@ -8,12 +8,15 @@ repositories up to a few hundred thousand chunks and needs no extra service.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import sqlite3
-from collections.abc import Iterable, Iterator
+import threading
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Concatenate, ParamSpec, TypeVar
 
 import numpy as np
 import numpy.typing as npt
@@ -85,10 +88,28 @@ def index_dir_for(root: Path, index_root: Path) -> Path:
     return index_root / f"{resolved.name or 'root'}-{digest}"
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _locked(
+    method: Callable[Concatenate[IndexStore, _P], _R],
+) -> Callable[Concatenate[IndexStore, _P], _R]:
+    def wrapper(self: IndexStore, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    functools.update_wrapper(wrapper, method)
+    return wrapper
+
+
 class IndexStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        # One connection shared across threads (shell warmup, MCP worker threads);
+        # every access goes through self._lock.
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -102,6 +123,7 @@ class IndexStore:
     def for_repo(cls, root: Path, index_root: Path) -> IndexStore:
         return cls(index_dir_for(root, index_root) / "index.sqlite3")
 
+    @_locked
     def close(self) -> None:
         self._conn.close()
 
@@ -113,16 +135,18 @@ class IndexStore:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        with self._conn:
+        with self._lock, self._conn:
             yield self._conn
             self._bump_generation()
 
     # -- metadata ---------------------------------------------------------
 
+    @_locked
     def get_meta(self, key: str) -> str | None:
         row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else str(row[0])
 
+    @_locked
     def set_meta(self, key: str, value: str) -> None:
         self._conn.execute(
             "INSERT INTO meta(key, value) VALUES(?, ?) "
@@ -136,9 +160,11 @@ class IndexStore:
             "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1"
         )
 
+    @_locked
     def generation(self) -> int:
         return int(self.get_meta("generation") or 0)
 
+    @_locked
     def ensure_compatible(self, root: Path, model_id: str, dim: int) -> None:
         """Stamp a fresh index, or verify an existing one matches this model and dimension."""
         stored_model = self.get_meta("model_id")
@@ -164,6 +190,7 @@ class IndexStore:
 
     # -- files and chunks -------------------------------------------------
 
+    @_locked
     def files(self) -> dict[str, FileRecord]:
         rows = self._conn.execute("SELECT id, path, size, mtime_ns, sha256 FROM files")
         return {r[1]: FileRecord(*r) for r in rows}
@@ -200,6 +227,7 @@ class IndexStore:
             ],
         )
 
+    @_locked
     def clear(self) -> None:
         with self._conn:
             self._conn.execute("DELETE FROM chunks")
@@ -208,6 +236,7 @@ class IndexStore:
         self._matrix = None
         self._matrix_generation = -1
 
+    @_locked
     def stats(self) -> dict[str, int]:
         files = self._conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         chunks = self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
@@ -230,6 +259,7 @@ class IndexStore:
             self._matrix, self._matrix_ids, self._matrix_generation = matrix, ids, gen
         return self._matrix, self._matrix_ids
 
+    @_locked
     def search(self, query_vec: Vectors, k: int, path_glob: str | None = None) -> list[Hit]:
         matrix, ids = self._load_matrix()
         if len(ids) == 0 or k <= 0:
