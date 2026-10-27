@@ -16,10 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 
 from codeseek.embedder import Vectors
 
 SCHEMA_VERSION = 1
+
+Ids = npt.NDArray[np.int64]
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -92,7 +95,7 @@ class IndexStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._matrix: Vectors | None = None
-        self._matrix_ids: np.ndarray | None = None
+        self._matrix_ids: Ids | None = None
         self._matrix_generation = -1
 
     @classmethod
@@ -212,7 +215,7 @@ class IndexStore:
 
     # -- search -----------------------------------------------------------
 
-    def _load_matrix(self) -> tuple[Vectors, np.ndarray]:
+    def _load_matrix(self) -> tuple[Vectors, Ids]:
         gen = self.generation()
         if self._matrix is None or self._matrix_ids is None or gen != self._matrix_generation:
             dim = int(self.get_meta("dim") or 0)
